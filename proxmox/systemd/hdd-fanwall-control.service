@@ -1,0 +1,6 @@
+[Unit]
+Description=HDD Fanwall Control
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/hdd_fanwall_control.sh

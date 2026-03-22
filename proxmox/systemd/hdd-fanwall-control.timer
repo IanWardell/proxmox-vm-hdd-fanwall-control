@@ -1,0 +1,10 @@
+[Unit]
+Description=Run HDD Fanwall Control
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=15s
+Unit=hdd-fanwall-control.service
+
+[Install]
+WantedBy=timers.target
