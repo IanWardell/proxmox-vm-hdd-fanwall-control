@@ -1,6 +1,19 @@
 [Unit]
-Description=HDD Fanwall Control
+Description=Control HDD fan wall from Unraid HDD temperatures
+ConditionPathExists=/usr/local/sbin/hdd_fanwall_control.sh
+ConditionPathExists=/etc/hdd-fanwall-control.cfg
+After=local-fs.target
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/hdd_fanwall_control.sh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectSystem=strict
+ReadWritePaths=/sys/class/hwmon /run /var/lib/fan-control
+RestrictSUIDSGID=true
+LockPersonality=true
