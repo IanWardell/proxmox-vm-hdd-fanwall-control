@@ -26,6 +26,17 @@ is_uint() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
 }
 
+is_enabled() {
+  case "${1:-no}" in
+    yes|true|1|on)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 state_mode=""
 state_reason=""
 state_band=""
@@ -107,7 +118,7 @@ resolve_hwmon_path() {
 }
 
 validate_config_values() {
-  local key var suffix value curve_count
+  local key
 
   for key in SAFE_FALLBACK_PWM MAX_FILE_AGE_SECONDS READ_TIMEOUT_SECONDS MIN_PWM MAX_PWM \
     HOT_DRIVE_COUNT_BUMP_THRESHOLD HOT_DRIVE_PWM_BUMP HYSTERESIS_C; do
@@ -117,9 +128,45 @@ validate_config_values() {
     fi
   done
 
+  validate_curve_values "PWM_AT_" "HDD fan curve" || return 1
+
+  if is_enabled "${AIO_FANWALL_ENABLE:-no}"; then
+    for key in CPU_TEMP_MAX_VALID_C; do
+      if ! is_uint "${!key:-}"; then
+        echo "invalid numeric config: $key=${!key:-}" >&2
+        return 1
+      fi
+    done
+
+    if [ -z "${CPU_TEMP_HWMON_PATH:-}" ] || [ -z "${CPU_TEMP_INPUT_NAME:-}" ]; then
+      echo "CPU temp config requires CPU_TEMP_HWMON_PATH and CPU_TEMP_INPUT_NAME" >&2
+      return 1
+    fi
+
+    if [ ! -r "$CPU_TEMP_HWMON_PATH/$CPU_TEMP_INPUT_NAME" ]; then
+      echo "missing or unreadable CPU temp input: $CPU_TEMP_HWMON_PATH/$CPU_TEMP_INPUT_NAME" >&2
+      return 1
+    fi
+
+    validate_curve_values "CPU_PWM_AT_" "CPU fan curve" || return 1
+  fi
+
+  if [ "$MIN_PWM" -gt "$MAX_PWM" ]; then
+    echo "MIN_PWM is greater than MAX_PWM" >&2
+    return 1
+  fi
+
+  return 0
+}
+
+validate_curve_values() {
+  local prefix="$1"
+  local name="$2"
+  local var suffix value curve_count
+
   curve_count=0
-  for var in $(compgen -A variable PWM_AT_); do
-    suffix="${var#PWM_AT_}"
+  for var in $(compgen -A variable "$prefix"); do
+    suffix="${var#"$prefix"}"
     value="${!var:-}"
 
     if [[ "$suffix" =~ ^[0-9]+$ ]]; then
@@ -138,12 +185,7 @@ validate_config_values() {
   done
 
   if [ "$curve_count" -eq 0 ]; then
-    echo "no fan curve entries found; define PWM_AT_<temp>=<pwm>" >&2
-    return 1
-  fi
-
-  if [ "$MIN_PWM" -gt "$MAX_PWM" ]; then
-    echo "MIN_PWM is greater than MAX_PWM" >&2
+    echo "no $name entries found; define ${prefix}<temp>=<pwm>" >&2
     return 1
   fi
 
@@ -189,6 +231,15 @@ read_current_rpm() {
   if [ -r "$ACTIVE_HWMON_PATH/$RPM_NAME" ]; then
     cat "$ACTIVE_HWMON_PATH/$RPM_NAME" 2>/dev/null || true
   fi
+}
+
+read_cpu_temp_c() {
+  local raw
+
+  raw="$(cat "$CPU_TEMP_HWMON_PATH/$CPU_TEMP_INPUT_NAME" 2>/dev/null)" || return 1
+  is_uint "$raw" || return 1
+
+  printf '%s\n' $((raw / 1000))
 }
 
 read_input_file() {
@@ -264,10 +315,11 @@ get_read_input_status() {
 }
 
 fan_curve_points() {
+  local prefix="$1"
   local var suffix temp
 
-  for var in $(compgen -A variable PWM_AT_); do
-    suffix="${var#PWM_AT_}"
+  for var in $(compgen -A variable "$prefix"); do
+    suffix="${var#"$prefix"}"
     if [[ "$suffix" =~ ^([0-9]+)$ ]]; then
       temp="${BASH_REMATCH[1]}"
     elif [[ "$suffix" =~ ^([0-9]+)_PLUS$ ]]; then
@@ -282,6 +334,8 @@ fan_curve_points() {
 
 choose_curve_point_for_temp() {
   local t="$1"
+  local prefix="$2"
+  local band_prefix="$3"
   local point_temp point_pwm last_temp="" last_pwm=""
 
   while read -r point_temp point_pwm; do
@@ -289,32 +343,34 @@ choose_curve_point_for_temp() {
     last_pwm="$point_pwm"
 
     if [ "$t" -le "$point_temp" ]; then
-      printf 't%s:%s\n' "$point_temp" "$point_pwm"
+      printf '%s%s:%s\n' "$band_prefix" "$point_temp" "$point_pwm"
       return
     fi
-  done < <(fan_curve_points)
+  done < <(fan_curve_points "$prefix")
 
-  printf 't%s:%s\n' "$last_temp" "$last_pwm"
+  printf '%s%s:%s\n' "$band_prefix" "$last_temp" "$last_pwm"
 }
 
 choose_band_and_pwm_with_hysteresis() {
   local t="$1"
   local current_band="$2"
+  local prefix="$3"
+  local band_prefix="$4"
   local selection target_band target_temp current_temp point_temp current_pwm
 
-  selection="$(choose_curve_point_for_temp "$t")"
+  selection="$(choose_curve_point_for_temp "$t" "$prefix" "$band_prefix")"
   target_band="${selection%%:*}"
-  target_temp="${target_band#t}"
+  target_temp="${target_band#"$band_prefix"}"
 
-  if [[ "$current_band" =~ ^t([0-9]+)$ ]]; then
+  if [[ "$current_band" =~ ^${band_prefix}([0-9]+)$ ]]; then
     current_temp="${BASH_REMATCH[1]}"
     if [ "$target_temp" -lt "$current_temp" ] && [ "$t" -ge $((current_temp - HYSTERESIS_C)) ]; then
       while read -r point_temp current_pwm; do
         if [ "$point_temp" -eq "$current_temp" ]; then
-          printf 't%s:%s\n' "$current_temp" "$current_pwm"
+          printf '%s%s:%s\n' "$band_prefix" "$current_temp" "$current_pwm"
           return
         fi
-      done < <(fan_curve_points)
+      done < <(fan_curve_points "$prefix")
     fi
   fi
 
@@ -415,9 +471,14 @@ if [ "$parsed_max_temp_c" -lt 10 ] || [ "$parsed_max_temp_c" -gt 80 ]; then
   enter_fallback "invalid_max_temp" "max_temp=$parsed_max_temp_c source_host=${parsed_source_host:-unknown}"
 fi
 
-selection="$(choose_band_and_pwm_with_hysteresis "$parsed_max_temp_c" "$state_band")"
+selection="$(choose_band_and_pwm_with_hysteresis "$parsed_max_temp_c" "$state_band" "PWM_AT_" "hdd_t")"
 target_band="${selection%%:*}"
 target_pwm="${selection##*:}"
+target_reason="hdd_max_temp=$parsed_max_temp_c"
+cpu_temp_c=""
+cpu_selection=""
+cpu_band=""
+cpu_pwm=""
 
 if [ "$parsed_hot_drive_count" -ge "$HOT_DRIVE_COUNT_BUMP_THRESHOLD" ]; then
   target_pwm=$((target_pwm + HOT_DRIVE_PWM_BUMP))
@@ -426,25 +487,47 @@ if [ "$target_pwm" -gt "$MAX_PWM" ]; then
   target_pwm="$MAX_PWM"
 fi
 
+if is_enabled "${AIO_FANWALL_ENABLE:-no}"; then
+  if ! cpu_temp_c="$(read_cpu_temp_c)"; then
+    log "ERROR: cpu temp read failed path=$CPU_TEMP_HWMON_PATH/$CPU_TEMP_INPUT_NAME"
+    enter_fallback "cpu_temp_read_failed" "path=$CPU_TEMP_HWMON_PATH/$CPU_TEMP_INPUT_NAME"
+  fi
+
+  if [ "$cpu_temp_c" -lt 0 ] || [ "$cpu_temp_c" -gt "$CPU_TEMP_MAX_VALID_C" ]; then
+    log "ERROR: invalid cpu temp value=$cpu_temp_c path=$CPU_TEMP_HWMON_PATH/$CPU_TEMP_INPUT_NAME"
+    enter_fallback "invalid_cpu_temp" "cpu_temp=$cpu_temp_c path=$CPU_TEMP_HWMON_PATH/$CPU_TEMP_INPUT_NAME"
+  fi
+
+  cpu_selection="$(choose_band_and_pwm_with_hysteresis "$cpu_temp_c" "$state_band" "CPU_PWM_AT_" "cpu_t")"
+  cpu_band="${cpu_selection%%:*}"
+  cpu_pwm="${cpu_selection##*:}"
+
+  if [ "$cpu_pwm" -gt "$target_pwm" ]; then
+    target_band="$cpu_band"
+    target_pwm="$cpu_pwm"
+    target_reason="cpu_temp=$cpu_temp_c hdd_max_temp=$parsed_max_temp_c"
+  fi
+fi
+
 if ! applied_pwm="$(apply_set_pwm "$target_pwm")"; then
   log "ERROR: pwm write failed requested=$target_pwm hwmon_path=$ACTIVE_HWMON_PATH"
   exit 1
 fi
 
-write_state "normal" "max_temp=$parsed_max_temp_c" "$target_band" "$applied_pwm" "$parsed_max_temp_c"
+write_state "normal" "$target_reason" "$target_band" "$applied_pwm" "$parsed_max_temp_c"
 
 rpm="$(read_current_rpm)"
 
 if [ "$state_mode" = "fallback" ]; then
   if is_uint "$rpm"; then
-    log "RECOVERY pwm=$applied_pwm rpm=$rpm band=$target_band max_temp=$parsed_max_temp_c hot_drive_count=$parsed_hot_drive_count disk_count=$parsed_disk_count source_host=${parsed_source_host:-unknown} previous_reason=${state_reason:-fallback}"
+    log "RECOVERY pwm=$applied_pwm rpm=$rpm band=$target_band max_temp=$parsed_max_temp_c cpu_temp=${cpu_temp_c:-disabled} hot_drive_count=$parsed_hot_drive_count disk_count=$parsed_disk_count source_host=${parsed_source_host:-unknown} previous_reason=${state_reason:-fallback}"
   else
-    log "RECOVERY pwm=$applied_pwm band=$target_band max_temp=$parsed_max_temp_c hot_drive_count=$parsed_hot_drive_count disk_count=$parsed_disk_count source_host=${parsed_source_host:-unknown} previous_reason=${state_reason:-fallback}"
+    log "RECOVERY pwm=$applied_pwm band=$target_band max_temp=$parsed_max_temp_c cpu_temp=${cpu_temp_c:-disabled} hot_drive_count=$parsed_hot_drive_count disk_count=$parsed_disk_count source_host=${parsed_source_host:-unknown} previous_reason=${state_reason:-fallback}"
   fi
 elif [ "$state_pwm" != "$applied_pwm" ] || [ "$state_band" != "$target_band" ]; then
   if is_uint "$rpm"; then
-    log "PWM_SET pwm=$applied_pwm rpm=$rpm band=$target_band max_temp=$parsed_max_temp_c hot_drive_count=$parsed_hot_drive_count disk_count=$parsed_disk_count source_host=${parsed_source_host:-unknown}"
+    log "PWM_SET pwm=$applied_pwm rpm=$rpm band=$target_band max_temp=$parsed_max_temp_c cpu_temp=${cpu_temp_c:-disabled} hot_drive_count=$parsed_hot_drive_count disk_count=$parsed_disk_count source_host=${parsed_source_host:-unknown}"
   else
-    log "PWM_SET pwm=$applied_pwm band=$target_band max_temp=$parsed_max_temp_c hot_drive_count=$parsed_hot_drive_count disk_count=$parsed_disk_count source_host=${parsed_source_host:-unknown}"
+    log "PWM_SET pwm=$applied_pwm band=$target_band max_temp=$parsed_max_temp_c cpu_temp=${cpu_temp_c:-disabled} hot_drive_count=$parsed_hot_drive_count disk_count=$parsed_disk_count source_host=${parsed_source_host:-unknown}"
   fi
 fi

@@ -210,6 +210,49 @@ You can add, remove, or change points without editing the controller script. For
 PWM_AT_52=220
 ```
 
+### Optional CPU-Aware Control
+
+For AIO plus fan-wall setups, the Proxmox controller can also factor CPU temperature into the same fan wall decision. This is disabled by default.
+
+Enable it in `/etc/hdd-fanwall-control.cfg`:
+
+```bash
+AIO_FANWALL_ENABLE="yes"
+```
+
+Generic CPU temp settings:
+
+```bash
+CPU_TEMP_HWMON_PATH="/sys/class/hwmon/hwmon4"
+CPU_TEMP_INPUT_NAME="temp1_input"
+CPU_TEMP_MAX_VALID_C=105
+```
+
+On the current i7-8700K host, `temp1_input` is the `Package id 0` sensor from `coretemp`. Confirm on your system with:
+
+```bash
+for f in /sys/class/hwmon/hwmon*/temp*_label; do echo "$f: $(cat "$f" 2>/dev/null)"; done
+```
+
+CPU fan curve entries use `CPU_PWM_AT_<temp_c>=<pwm>`:
+
+```bash
+CPU_PWM_AT_50=120
+CPU_PWM_AT_60=140
+CPU_PWM_AT_70=170
+CPU_PWM_AT_80=204
+CPU_PWM_AT_90=235
+CPU_PWM_AT_95=255
+```
+
+When CPU-aware control is enabled, the controller calculates both targets and applies the higher PWM:
+
+```text
+applied_pwm = max(hdd_curve_pwm, cpu_curve_pwm)
+```
+
+If the CPU temperature input is missing, unreadable, or invalid while CPU-aware control is enabled, the controller applies the safe fallback PWM.
+
 These defaults should still be validated against your actual drives, ambient temperature, and chassis airflow.
 
 ## Notes
