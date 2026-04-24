@@ -346,7 +346,10 @@ esac
 
 read_state
 
-case "$(get_read_input_status)" in
+read_input_status="0"
+read_input_file || read_input_status="$?"
+
+case "$read_input_status" in
   0)
     ;;
   10)
