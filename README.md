@@ -79,6 +79,7 @@ proxmox-vm-hdd-fanwall-control/
 
    - `MIN_PWM` must stay at or above your safe floor
    - `SAFE_FALLBACK_PWM=204` is the fallback used when VM data is unavailable
+   - Fan curve entries are `PWM_AT_<temp_c>=<pwm>`; add or remove temperature points as needed
    - `HWMON_PATH` defaults to your known working path and the script will try auto-detection if that path becomes invalid
 
 6. Deploy from the repo root:
@@ -182,7 +183,32 @@ Defaults are intentionally conservative:
 - Minimum PWM floor: `120`
 - Fallback PWM: `204`
 - Max PWM: `255`
-- The ladder uses the full range up to `255` when temperatures reach `46C+`
+- Fan curve entries use `PWM_AT_<temp_c>=<pwm>`, for example `PWM_AT_47=180`
+- The controller discovers all `PWM_AT_<temp_c>` entries from the config at runtime
+- The controller uses the first configured temperature point that is at or above the current max HDD temperature
+- If the max HDD temperature is above the highest configured point, the controller uses the highest configured point
+- Hysteresis only delays fan speed reductions; fan speed increases are applied immediately
+
+Default fan curve:
+
+```bash
+PWM_AT_30=120
+PWM_AT_32=125
+PWM_AT_35=128
+PWM_AT_37=120
+PWM_AT_40=130
+PWM_AT_45=160
+PWM_AT_47=180
+PWM_AT_50=204
+PWM_AT_55=235
+PWM_AT_60=255
+```
+
+You can add, remove, or change points without editing the controller script. For example, adding this line creates a new threshold:
+
+```bash
+PWM_AT_52=220
+```
 
 These defaults should still be validated against your actual drives, ambient temperature, and chassis airflow.
 

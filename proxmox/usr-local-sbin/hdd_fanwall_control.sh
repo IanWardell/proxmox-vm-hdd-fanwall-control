@@ -107,16 +107,40 @@ resolve_hwmon_path() {
 }
 
 validate_config_values() {
-  local key
+  local key var suffix value curve_count
 
   for key in SAFE_FALLBACK_PWM MAX_FILE_AGE_SECONDS READ_TIMEOUT_SECONDS MIN_PWM MAX_PWM \
-    PWM_AT_30 PWM_AT_32 PWM_AT_35 PWM_AT_37 PWM_AT_39 PWM_AT_40 PWM_AT_42 PWM_AT_43 PWM_AT_45 PWM_AT_46_PLUS \
     HOT_DRIVE_COUNT_BUMP_THRESHOLD HOT_DRIVE_PWM_BUMP HYSTERESIS_C; do
     if ! is_uint "${!key:-}"; then
       echo "invalid numeric config: $key=${!key:-}" >&2
       return 1
     fi
   done
+
+  curve_count=0
+  for var in $(compgen -A variable PWM_AT_); do
+    suffix="${var#PWM_AT_}"
+    value="${!var:-}"
+
+    if [[ "$suffix" =~ ^[0-9]+$ ]]; then
+      curve_count=$((curve_count + 1))
+    elif [[ "$suffix" =~ ^[0-9]+_PLUS$ ]]; then
+      curve_count=$((curve_count + 1))
+    else
+      echo "invalid fan curve key: $var" >&2
+      return 1
+    fi
+
+    if ! is_uint "$value"; then
+      echo "invalid numeric config: $var=$value" >&2
+      return 1
+    fi
+  done
+
+  if [ "$curve_count" -eq 0 ]; then
+    echo "no fan curve entries found; define PWM_AT_<temp>=<pwm>" >&2
+    return 1
+  fi
 
   if [ "$MIN_PWM" -gt "$MAX_PWM" ]; then
     echo "MIN_PWM is greater than MAX_PWM" >&2
@@ -239,50 +263,62 @@ get_read_input_status() {
   fi
 }
 
-choose_band_and_pwm_for_temp() {
-  local t="$1"
+fan_curve_points() {
+  local var suffix temp
 
-  if [ "$t" -le 30 ]; then
-    printf 'band1:%s\n' "$PWM_AT_30"
-  elif [ "$t" -le 32 ]; then
-    printf 'band2:%s\n' "$PWM_AT_32"
-  elif [ "$t" -le 35 ]; then
-    printf 'band3:%s\n' "$PWM_AT_35"
-  elif [ "$t" -le 37 ]; then
-    printf 'band4:%s\n' "$PWM_AT_37"
-  elif [ "$t" -le 39 ]; then
-    printf 'band5:%s\n' "$PWM_AT_39"
-  elif [ "$t" -le 40 ]; then
-    printf 'band6:%s\n' "$PWM_AT_40"
-  elif [ "$t" -le 42 ]; then
-    printf 'band7:%s\n' "$PWM_AT_42"
-  elif [ "$t" -le 43 ]; then
-    printf 'band8:%s\n' "$PWM_AT_43"
-  elif [ "$t" -le 45 ]; then
-    printf 'band9:%s\n' "$PWM_AT_45"
-  else
-    printf 'band10:%s\n' "$PWM_AT_46_PLUS"
-  fi
+  for var in $(compgen -A variable PWM_AT_); do
+    suffix="${var#PWM_AT_}"
+    if [[ "$suffix" =~ ^([0-9]+)$ ]]; then
+      temp="${BASH_REMATCH[1]}"
+    elif [[ "$suffix" =~ ^([0-9]+)_PLUS$ ]]; then
+      temp="${BASH_REMATCH[1]}"
+    else
+      continue
+    fi
+
+    printf '%s %s\n' "$temp" "${!var}"
+  done | sort -n -k1,1
+}
+
+choose_curve_point_for_temp() {
+  local t="$1"
+  local point_temp point_pwm last_temp="" last_pwm=""
+
+  while read -r point_temp point_pwm; do
+    last_temp="$point_temp"
+    last_pwm="$point_pwm"
+
+    if [ "$t" -le "$point_temp" ]; then
+      printf 't%s:%s\n' "$point_temp" "$point_pwm"
+      return
+    fi
+  done < <(fan_curve_points)
+
+  printf 't%s:%s\n' "$last_temp" "$last_pwm"
 }
 
 choose_band_and_pwm_with_hysteresis() {
   local t="$1"
   local current_band="$2"
+  local selection target_band target_temp current_temp point_temp current_pwm
 
-  case "$current_band" in
-    band10) [ "$t" -ge $((46 - HYSTERESIS_C)) ] && { printf 'band10:%s\n' "$PWM_AT_46_PLUS"; return; } ;;
-    band9) [ "$t" -ge $((45 - HYSTERESIS_C)) ] && { printf 'band9:%s\n' "$PWM_AT_45"; return; } ;;
-    band8) [ "$t" -ge $((43 - HYSTERESIS_C)) ] && { printf 'band8:%s\n' "$PWM_AT_43"; return; } ;;
-    band7) [ "$t" -ge $((42 - HYSTERESIS_C)) ] && { printf 'band7:%s\n' "$PWM_AT_42"; return; } ;;
-    band6) [ "$t" -ge $((40 - HYSTERESIS_C)) ] && { printf 'band6:%s\n' "$PWM_AT_40"; return; } ;;
-    band5) [ "$t" -ge $((39 - HYSTERESIS_C)) ] && { printf 'band5:%s\n' "$PWM_AT_39"; return; } ;;
-    band4) [ "$t" -ge $((37 - HYSTERESIS_C)) ] && { printf 'band4:%s\n' "$PWM_AT_37"; return; } ;;
-    band3) [ "$t" -ge $((35 - HYSTERESIS_C)) ] && { printf 'band3:%s\n' "$PWM_AT_35"; return; } ;;
-    band2) [ "$t" -ge $((32 - HYSTERESIS_C)) ] && { printf 'band2:%s\n' "$PWM_AT_32"; return; } ;;
-    band1) [ "$t" -le 30 ] && { printf 'band1:%s\n' "$PWM_AT_30"; return; } ;;
-  esac
+  selection="$(choose_curve_point_for_temp "$t")"
+  target_band="${selection%%:*}"
+  target_temp="${target_band#t}"
 
-  choose_band_and_pwm_for_temp "$t"
+  if [[ "$current_band" =~ ^t([0-9]+)$ ]]; then
+    current_temp="${BASH_REMATCH[1]}"
+    if [ "$target_temp" -lt "$current_temp" ] && [ "$t" -ge $((current_temp - HYSTERESIS_C)) ]; then
+      while read -r point_temp current_pwm; do
+        if [ "$point_temp" -eq "$current_temp" ]; then
+          printf 't%s:%s\n' "$current_temp" "$current_pwm"
+          return
+        fi
+      done < <(fan_curve_points)
+    fi
+  fi
+
+  printf '%s\n' "$selection"
 }
 
 enter_fallback() {
