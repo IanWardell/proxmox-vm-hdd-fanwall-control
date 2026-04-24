@@ -228,11 +228,40 @@ CPU_TEMP_INPUT_NAME="temp1_input"
 CPU_TEMP_MAX_VALID_C=105
 ```
 
-On the current i7-8700K host, `temp1_input` is the `Package id 0` sensor from `coretemp`. Confirm on your system with:
+Find the correct CPU package temperature sensor on your Proxmox host with:
 
 ```bash
 for f in /sys/class/hwmon/hwmon*/temp*_label; do echo "$f: $(cat "$f" 2>/dev/null)"; done
 ```
+
+Look for a label such as `Package id 0`, `Tctl`, or `Tdie`. If the label path is:
+
+```text
+/sys/class/hwmon/hwmon4/temp1_label: Package id 0
+```
+
+then configure:
+
+```bash
+CPU_TEMP_HWMON_PATH="/sys/class/hwmon/hwmon4"
+CPU_TEMP_INPUT_NAME="temp1_input"
+```
+
+To choose a CPU fan curve, identify the CPU model and look up its official max junction temperature from the CPU vendor. On Proxmox:
+
+```bash
+lscpu | grep 'Model name'
+```
+
+For Intel CPUs, search the Intel ARK/specification page for that model and check `Tjunction`. For AMD CPUs, search the AMD product specification page and check the max operating temperature. Use that value as the upper safety boundary, not as the normal operating target.
+
+Then observe the CPU package temperature at idle and under a real workload:
+
+```bash
+watch -n 1 "awk '{printf \"CPU %.1fC\\n\", \$1/1000}' /sys/class/hwmon/hwmon4/temp1_input"
+```
+
+Replace `/sys/class/hwmon/hwmon4/temp1_input` with the input path discovered above. Build the `CPU_PWM_AT_<temp_c>` curve from those observations. For example, if the CPU normally idles below `50C`, is acceptable in the `60-75C` range, and should get strong airflow above `80C`, use lower PWM below `60C` and ramp more aggressively above `70C`.
 
 CPU fan curve entries use `CPU_PWM_AT_<temp_c>=<pwm>`:
 
