@@ -1,0 +1,15 @@
+name: Shell validation
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Shell syntax and lint
+        run: |
+          git ls-files '*.sh' | xargs -r -n1 bash -n
+          git ls-files '*.sh' | xargs -r shellcheck
+      - name: Hardware-free controller and exporter tests
+        run: python3 -m unittest discover -s tests -v

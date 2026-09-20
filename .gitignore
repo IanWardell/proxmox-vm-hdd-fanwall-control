@@ -2,3 +2,4 @@
 .codex/
 .envs
 test-code/
+__pycache__/

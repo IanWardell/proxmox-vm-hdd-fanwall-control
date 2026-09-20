@@ -20,7 +20,7 @@ This repo is designed for this architecture:
 - Missing, stale, invalid, or unreadable VM data forces a safe fallback PWM
 - Fallback and recovery events are logged to journald
 - Unraid skips standby disks instead of waking them
-- If Unraid cannot collect any valid temperatures, it leaves the previous file untouched
+- If Unraid cannot collect valid temperatures, it preserves the previous summary unless all disks are confirmed standby
 
 ## Repo layout
 
@@ -174,123 +174,158 @@ systemctl status hdd-fanwall-control.timer --no-pager
 - Stale file: fallback
 - Invalid file content: fallback
 - virtiofs read timeout: fallback
-- No valid disk temperatures in Unraid: the exporter does not replace the last known good file
+- No valid disk temperatures in Unraid: preserve the last good summary, except confirmed all-standby publishes fresh telemetry
 
-## Thermal policy defaults
+## Production thermal policy
 
-Defaults are intentionally conservative:
-
-- Minimum PWM floor: `120`
-- Fallback PWM: `204`
-- Max PWM: `255`
-- Fan curve entries use `PWM_AT_<temp_c>=<pwm>`, for example `PWM_AT_47=180`
-- The controller discovers all `PWM_AT_<temp_c>` entries from the config at runtime
-- The controller uses the first configured temperature point that is at or above the current max HDD temperature
-- If the max HDD temperature is above the highest configured point, the controller uses the highest configured point
-- Hysteresis only delays fan speed reductions; fan speed increases are applied immediately
-
-Default fan curve:
-
-```bash
-PWM_AT_30=120
-PWM_AT_32=125
-PWM_AT_35=128
-PWM_AT_37=120
-PWM_AT_40=130
-PWM_AT_45=160
-PWM_AT_47=180
-PWM_AT_50=204
-PWM_AT_55=235
-PWM_AT_60=255
-```
-
-You can add, remove, or change points without editing the controller script. For example, adding this line creates a new threshold:
-
-```bash
-PWM_AT_52=220
-```
-
-### Optional CPU-Aware Control
-
-For AIO plus fan-wall setups, the Proxmox controller can also factor CPU temperature into the same fan wall decision. This is disabled by default.
-
-Enable it in `/etc/hdd-fanwall-control.cfg`:
-
-```bash
-AIO_FANWALL_ENABLE="yes"
-```
-
-Generic CPU temp settings:
-
-```bash
-CPU_TEMP_HWMON_PATH="/sys/class/hwmon/hwmon4"
-CPU_TEMP_INPUT_NAME="temp1_input"
-CPU_TEMP_MAX_VALID_C=105
-```
-
-Find the correct CPU package temperature sensor on your Proxmox host with:
-
-```bash
-for f in /sys/class/hwmon/hwmon*/temp*_label; do echo "$f: $(cat "$f" 2>/dev/null)"; done
-```
-
-Look for a label such as `Package id 0`, `Tctl`, or `Tdie`. If the label path is:
+The checked-in configs are the intended LGNAS CSE-846 production defaults, not
+examples. This initial curve is an intermediate setting to validate after the
+six-fan push/pull hardware expansion. Disk counts are discovered dynamically.
 
 ```text
-/sys/class/hwmon/hwmon4/temp1_label: Package id 0
+HDD temperature °C   30  35  37  39  40  42  44  45  47  50  55  60
+HDD PWM            100 105 110 120 130 145 160 170 195 225 255 255
+CPU temperature °C  50  60  70  80  90  95
+CPU PWM            120 140 170 204 235 255
 ```
 
-then configure:
+`AIO_FANWALL_ENABLE="yes"`: final demand is the **maximum** of independent HDD
+and CPU demands. Minimum PWM is 100, maximum is 255. Curve keys are discovered
+dynamically, including legacy `PWM_AT_<temp>_PLUS` keys. The first threshold at
+or above the temperature wins: **43°C selects `PWM_AT_44=160`**. Above the last
+threshold, its PWM applies. Each curve must be nondecreasing, remain inside
+MIN/MAX, and use unique temperatures; the HDD curve must reach MAX_PWM.
 
-```bash
-CPU_TEMP_HWMON_PATH="/sys/class/hwmon/hwmon4"
-CPU_TEMP_INPUT_NAME="temp1_input"
-```
+Each controller retains its own band in `/run/hdd_fanwall_control.state`.
+Upward band changes are immediate. The existing `HYSTERESIS_C=2` reduction rule
+holds the prior band while temperature is at least that band's temperature
+minus 2°C. Hot-drive modifiers are recalculated each sample and do not stack.
 
-To choose a CPU fan curve, identify the CPU model and look up its official max junction temperature from the CPU vendor. On Proxmox:
+The exporter counts measured drives at or above 42°C as hot. Bonuses use
+`TEMP_COUNT`, excluding standby and unknown disks:
 
-```bash
-lscpu | grep 'Model name'
-```
+| Condition | HDD bonus |
+| --- | ---: |
+| At least 8 hot and at least 70% measured hot | +24 |
+| Otherwise at least 4 hot and at least 50% measured hot | +16 |
+| Otherwise | 0 |
 
-For Intel CPUs, search the Intel ARK/specification page for that model and check `Tjunction`. For AMD CPUs, search the AMD product specification page and check the max operating temperature. Use that value as the upper safety boundary, not as the normal operating target.
+Four of five measured drives qualifies for +16; four of fourteen does not.
+Eight of fourteen gets +16; ten of fourteen gets +24. Bonuses cap at MAX_PWM.
+CPU arbitration happens after the HDD bonus.
 
-Then observe the CPU package temperature at idle and under a real workload:
+The CPU input prefers the configured path when it contains a valid reading.
+Otherwise it searches hwmon for `CPU_TEMP_HWMON_NAME_REGEX="^coretemp$"` and
+`CPU_TEMP_LABEL_REGEX="^Package id 0$"`. Missing, invalid, or ambiguous discovery
+is a CPU fault.
 
-```bash
-watch -n 1 "awk '{printf \"CPU %.1fC\\n\", \$1/1000}' /sys/class/hwmon/hwmon4/temp1_input"
-```
+| Condition | Decision |
+| --- | --- |
+| Missing, unreadable, stale (>120s), future or invalid HDD summary | max(204, valid CPU demand) |
+| CPU sensor unavailable or invalid | CPU_FALLBACK_PWM=255 |
+| All discovered HDDs confirmed standby, none unknown | HDD minimum floor; CPU control remains active |
+| Some disks unknown | Warning on unknown-count change |
+| At least 50% of discovered disks unknown | HDD telemetry fallback |
+| PWM/manual-mode write failure | Nonzero error; no successful state recorded |
 
-Replace `/sys/class/hwmon/hwmon4/temp1_input` with the input path discovered above. Build the `CPU_PWM_AT_<temp_c>` curve from those observations. For example, if the CPU normally idles below `50C`, is acceptable in the `60-75C` range, and should get strong airflow above `80C`, use lower PWM below `60C` and ramp more aggressively above `70C`.
+No valid temperatures with any unknown disks leaves the exporter's last good
+summary untouched; it will expire into fallback. Confirmed all-standby is the
+exception and publishes fresh healthy telemetry. The timer remains 20s after
+boot, then every 15s with 1s accuracy; input reads time out after 2s.
 
-CPU fan curve entries use `CPU_PWM_AT_<temp_c>=<pwm>`:
+## Schema v2 and diagnostics
 
-```bash
-CPU_PWM_AT_50=120
-CPU_PWM_AT_60=140
-CPU_PWM_AT_70=170
-CPU_PWM_AT_80=204
-CPU_PWM_AT_90=235
-CPU_PWM_AT_95=255
-```
-
-When CPU-aware control is enabled, the controller calculates both targets and applies the higher PWM:
+The host explicitly parses VM data and never sources or executes it. This release
+requires schema v2, so deploy the exporter first. Missing/duplicate required keys,
+noncanonical unsigned integers, invalid timestamps, impossible counts and unknown
+schema versions trigger fallback. Counts must account for every discovered disk:
+`TEMP_COUNT + STANDBY_COUNT + UNKNOWN_COUNT == DISK_COUNT`; hot count must not
+exceed measured count. `HOT_THRESHOLD_C` must be between 10 and 80°C.
 
 ```text
-applied_pwm = max(hdd_curve_pwm, cpu_curve_pwm)
+SCHEMA_VERSION=2
+GENERATED_EPOCH=1789870000
+SOURCE_HOST=unraid-pve-LNAS
+DISK_COUNT=14
+TEMP_COUNT=14
+STANDBY_COUNT=0
+UNKNOWN_COUNT=0
+HOT_THRESHOLD_C=42
+HOT_DRIVE_COUNT=5
+MAX_TEMP_C=43
 ```
 
-If the CPU temperature input is missing, unreadable, or invalid while CPU-aware control is enabled, the controller applies the safe fallback PWM.
+For all-standby, `TEMP_COUNT=0`, `STANDBY_COUNT=DISK_COUNT`, `UNKNOWN_COUNT=0`,
+`HOT_DRIVE_COUNT=0` and `MAX_TEMP_C=0` (a sentinel, not a measured temperature).
 
-These defaults should still be validated against your actual drives, ambient temperature, and chassis airflow.
+Unraid also atomically writes `/mnt/proxmox-fan/hdd_temp_detail.tsv` with columns
+`serial`, `model`, `device`, `state`, `temp_c`. Identity comes from the same
+standby-safe SMART query; unavailable identity is `unknown`. The host control
+loop never depends on this diagnostic file. Each summary is also atomically
+replaced; the two files are independent snapshots.
 
-## Notes
+```bash
+/usr/local/sbin/hdd_fanwall_control.sh --status
+/usr/local/sbin/hdd_fanwall_control.sh --dry-run
+```
 
-- The host only trusts numeric fields from the VM-written file
-- The current export format is intentionally minimal and safe to parse
-- Standby disks are skipped with `smartctl -n standby`
-- The exporter dynamically rescans disks every run, so it scales as you add drives
-- The hardcoded `HWMON_PATH` is still a motherboard-specific assumption; keep an eye on it after BIOS/kernel changes
+Both calculate the current decision and report input age/counts, HDD base/bonus,
+CPU demand, selected source, final request and actual PWM/RPM without writing
+PWM, state, or logs. `--status` is a current calculation, not merely the last
+applied decision. `--validate-only` and `--print-hwmon-path` remain supported.
+
+Journald `fan-control` records full decisions on PWM/band transitions, fallback
+entry/reason change and recovery. Thermal transitions at 50°C (warning), 55°C
+(critical) and recovery are logged once per change, as are unknown-disk counts.
+
+## Updating the existing installation
+
+Keep backups of the installed scripts as well as the configs before rollout.
+On Unraid, run from the new release checkout:
+
+```bash
+bash ./deploy-unraid.sh --force-config
+/boot/config/custom/hdd_temp_export_virtiofs.sh
+cat /mnt/proxmox-fan/hdd_temp_status.env
+cat /mnt/proxmox-fan/hdd_temp_detail.tsv
+```
+
+Once fresh schema v2 data is present, run on Proxmox as root:
+
+```bash
+bash ./deploy-proxmox.sh --force-config
+systemctl daemon-reload
+systemctl restart hdd-fanwall-control.timer
+/usr/local/sbin/hdd_fanwall_control.sh --validate-only
+/usr/local/sbin/hdd_fanwall_control.sh --dry-run
+systemctl start hdd-fanwall-control.service
+/usr/local/sbin/hdd_fanwall_control.sh --status
+```
+
+Both deploy scripts preserve timestamped config backups when `--force-config`
+is used. Preserve the existing Unraid schedule and mount. To roll back, restore
+the saved scripts/configs together and restart the host timer.
+
+## Automated and hardware validation
+
+```bash
+python3 -m unittest discover -s tests -v
+git ls-files '*.sh' | xargs -r -n1 bash -n
+git ls-files '*.sh' | xargs -r shellcheck
+```
+
+CI runs these checks. Tests use temporary fake sensors and command fixtures,
+not live hardware. `CONFIG_FILE`, `STATE_FILE`, and `HWMON_ROOT` are overridable
+for the controller; the exporter also accepts a `CONFIG_FILE` override.
+
+After installing the extra fan bank and drives, record per-drive temperature,
+maximum temperature, hot count, both PWM demands, final PWM and RPM at 30, 60
+and 120 minutes of sustained array activity, ideally a parity check. At roughly
+24°C ambient, target typical drives 36–40°C and hottest sustained drives 40–42°C;
+43–44°C peaks are acceptable, 50°C warrants investigation, and 55°C requests full
+PWM. Separately test CPU load, then combined CPU/array load, checking that final
+PWM is the larger demand throughout. These physical thermal/noise targets are
+not established by the automated tests.
 
 ## Uninstall
 

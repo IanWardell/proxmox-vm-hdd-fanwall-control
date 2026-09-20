@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-CONFIG_FILE="/boot/config/custom/hdd_temp_export_virtiofs.conf"
+CONFIG_FILE="${CONFIG_FILE:-/boot/config/custom/hdd_temp_export_virtiofs.conf}"
 
 if [ ! -f "$CONFIG_FILE" ]; then
   echo "missing config file: $CONFIG_FILE" >&2
@@ -10,6 +10,11 @@ fi
 
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
+DETAIL_FILE="${DETAIL_FILE:-$MOUNT_POINT/hdd_temp_detail.tsv}"
+if [[ ! "$HOT_TEMP_C" =~ ^[1-9][0-9]?$ ]] || ((HOT_TEMP_C < 10 || HOT_TEMP_C > 80)); then
+  echo "invalid HOT_TEMP_C" >&2
+  exit 1
+fi
 
 log_message() {
   local message="$1"
@@ -42,24 +47,20 @@ ensure_mount() {
 }
 
 discover_disks() {
-  if [ "$ONLY_ROTATIONAL_DISKS" = "yes" ]; then
-    lsblk -dn -o PATH,TYPE,RM,TRAN,ROTA | awk '
-      $2 == "disk" &&
-      $3 == "0" &&
-      $4 != "usb" &&
-      $5 == "1" {
-        print $1
+  # Pairs preserve empty TRAN values (common with virtio disks).
+  lsblk -dnP -o PATH,TYPE,RM,TRAN,ROTA | awk -v rotational="$ONLY_ROTATIONAL_DISKS" '
+    {
+      delete fields
+      for (i = 1; i <= NF; i++) {
+        split($i, pair, "=")
+        gsub(/"/, "", pair[2])
+        fields[pair[1]] = pair[2]
       }
-    '
-  else
-    lsblk -dn -o PATH,TYPE,RM,TRAN | awk '
-      $2 == "disk" &&
-      $3 == "0" &&
-      $4 != "usb" {
-        print $1
-      }
-    '
-  fi
+      if (fields["TYPE"] == "disk" && fields["RM"] == "0" && fields["TRAN"] != "usb" &&
+          (rotational != "yes" || fields["ROTA"] == "1")) print fields["PATH"]
+    }
+  '
+
 }
 
 extract_temp_c() {
@@ -92,22 +93,27 @@ read_disk_temp() {
   local temp
 
   if [ "$SMART_STANDBY_MODE" = "yes" ]; then
-    output="$(smartctl -n standby -A "$disk" 2>&1 || true)"
+    output="$(smartctl -n standby -i -A "$disk" 2>&1 || true)"
   else
-    output="$(smartctl -A "$disk" 2>&1 || true)"
+    output="$(smartctl -i -A "$disk" 2>&1 || true)"
   fi
 
+  # Read identity from the same standby-safe query; never issue a second wake-up query.
+  disk_serial="$(printf '%s\n' "$output" | awk -F: '/^[[:space:]]*Serial [Nn]umber:/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}' | tr '\t\r\n' '   ')"
+  disk_model="$(printf '%s\n' "$output" | awk -F: '/^[[:space:]]*(Device Model|Model Number|Product):/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}' | tr '\t\r\n' '   ')"
+  disk_serial="${disk_serial:-unknown}" disk_model="${disk_model:-unknown}"
+  disk_state=unknown disk_temp=""
   if echo "$output" | grep -qiE 'STANDBY|standby mode'; then
-    printf 'standby:\n'
+    disk_state=standby
     return 0
   fi
 
-  if temp="$(printf '%s\n' "$output" | extract_temp_c)" && [[ "$temp" =~ ^[0-9]+$ ]]; then
-    printf 'active:%s\n' "$temp"
+  if temp="$(printf '%s\n' "$output" | extract_temp_c)" && [[ "$temp" =~ ^[1-8][0-9]$ ]] && ((temp <= 80)); then
+    disk_state=active disk_temp="$temp"
     return 0
   fi
 
-  printf 'unknown:\n'
+  disk_state=unknown
   return 0
 }
 
@@ -136,16 +142,19 @@ fi
 disk_count=0
 temp_count=0
 standby_count=0
+unknown_count=0
 hot_drive_count=0
 max_temp=""
 
+tmp_file="" detail_tmp="$(mktemp "${DETAIL_FILE}.tmp.XXXXXX")"
+trap 'rm -f -- "${tmp_file:-}" "${detail_tmp:-}"' EXIT
+printf 'serial\tmodel\tdevice\tstate\ttemp_c\n' > "$detail_tmp"
 for disk in "${disks[@]}"; do
-  [ -b "$disk" ] || continue
   disk_count=$((disk_count + 1))
 
-  result="$(read_disk_temp "$disk")"
-  state="${result%%:*}"
-  temp="${result#*:}"
+  read_disk_temp "$disk"
+  state="$disk_state" temp="$disk_temp"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$disk_serial" "$disk_model" "$disk" "$state" "$temp" >> "$detail_tmp"
 
   case "$state" in
     standby)
@@ -161,25 +170,33 @@ for disk in "${disks[@]}"; do
       fi
       ;;
     *)
+      unknown_count=$((unknown_count + 1))
       ;;
   esac
 done
 
-if [ "$temp_count" -eq 0 ] || [ -z "$max_temp" ]; then
+chmod 0644 "$detail_tmp"
+mv -f "$detail_tmp" "$DETAIL_FILE"
+
+# All standby is healthy telemetry. Unknown/no temperatures retains last good summary.
+if [ "$temp_count" -eq 0 ] && [ "$standby_count" -ne "$disk_count" ]; then
   log_message "ERROR: no valid HDD temperatures collected disks=$disk_count standby=$standby_count"
   exit 1
 fi
 
 tmp_file="$(mktemp "${OUTPUT_FILE}.tmp.XXXXXX")"
 {
+  printf 'SCHEMA_VERSION=2\n'
+  printf 'TEMP_COUNT=%s\nSTANDBY_COUNT=%s\nUNKNOWN_COUNT=%s\n' "$temp_count" "$standby_count" "$unknown_count"
+  printf 'HOT_THRESHOLD_C=%s\n' "$HOT_TEMP_C"
   printf 'GENERATED_EPOCH=%s\n' "$(date +%s)"
   printf 'SOURCE_HOST=%s\n' "$(hostname -s)"
   printf 'DISK_COUNT=%s\n' "$disk_count"
   printf 'HOT_DRIVE_COUNT=%s\n' "$hot_drive_count"
-  printf 'MAX_TEMP_C=%s\n' "$max_temp"
+  printf 'MAX_TEMP_C=%s\n' "${max_temp:-0}"
 } > "$tmp_file"
 
+chmod 0644 "$tmp_file"
 mv -f "$tmp_file" "$OUTPUT_FILE"
-chmod 0644 "$OUTPUT_FILE"
 
 log_message "Updated $OUTPUT_FILE disks=$disk_count temps=$temp_count standby=$standby_count max_temp=$max_temp hot_drive_count=$hot_drive_count"
