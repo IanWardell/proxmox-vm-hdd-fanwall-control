@@ -280,8 +280,13 @@ entry/reason change and recovery. Thermal transitions at 50°C (warning), 55°C
 
 ## Updating the existing installation
 
-Keep backups of the installed scripts as well as the configs before rollout.
-On Unraid, run from the new release checkout:
+Update the Unraid exporter first, then the Proxmox controller. Run deployment
+commands as root from the new release checkout. The repository configs are the
+production defaults; `--force-config` deliberately replaces the installed config
+and keeps a timestamped copy of the previous one.
+
+On Unraid, back up the installed exporter script before deployment (the Unraid
+deploy script automatically backs up the config, but not the exporter script):
 
 ```bash
 bash ./deploy-unraid.sh --force-config
@@ -294,12 +299,11 @@ Once fresh schema v2 data is present, run on Proxmox as root:
 
 ```bash
 bash ./deploy-proxmox.sh --force-config
-systemctl daemon-reload
-systemctl restart hdd-fanwall-control.timer
 /usr/local/sbin/hdd_fanwall_control.sh --validate-only
 /usr/local/sbin/hdd_fanwall_control.sh --dry-run
-systemctl start hdd-fanwall-control.service
 /usr/local/sbin/hdd_fanwall_control.sh --status
+systemctl status hdd-fanwall-control.timer --no-pager
+systemctl show hdd-fanwall-control.service -p Result -p ExecMainStatus
 ```
 
 Use `bash` for scripts on Unraid’s noexec boot filesystem.
@@ -314,6 +318,32 @@ Deployment failures restore the previous files and timer state. An incompatible
 older configuration is rejected before replacement; use `--force-config` after
 reviewing the production defaults.
 
+The deploy script handles `daemon-reload`, enables and restarts the timer, and
+starts the service immediately; separate restart commands are unnecessary.
+Without `--force-config`, an existing compatible config is preserved. A successful
+deployment confirms the service ran, but it can still be in safe fallback if
+telemetry is unavailable: check that `--status` reports `mode=normal` and fresh
+schema-v2 data.
+
+### Reading a running controller
+
+Run status commands as root because the controller's state file is private.
+Compare `final_requested_pwm` with `current_pwm`, and check that the final request
+is the larger of `hdd_requested_pwm` and `cpu_requested_pwm` in normal operation.
+CPU temperature can change between timer invocations and a status query, so the
+current calculation may differ from the last stored CPU decision.
+
+Hysteresis can hold a higher HDD band while drives cool: after selecting the
+45°C band, a 43°C reading still requests 170 PWM; the band can drop once the
+temperature falls below 43°C. A hot-drive bonus disappears when its count or
+percentage condition is no longer met. CPU band transitions can produce a
+`PWM_SET` log even when HDD demand keeps the final PWM unchanged.
+
+PWM readback confirms the requested duty value reached sysfs. RPM readback alone
+does not establish that the configured tachometer belongs to the controlled fan
+bank. Verify that physical fan speed responds to demand changes before treating
+the hardware airflow response as validated.
+
 ## Automated and hardware validation
 
 ```bash
@@ -322,8 +352,11 @@ git ls-files '*.sh' | xargs -r -n1 bash -n
 git ls-files '*.sh' | xargs -r shellcheck
 ```
 
-CI runs these checks. Tests use temporary fake sensors and command fixtures,
-not live hardware. `CONFIG_FILE`, `STATE_FILE`, and `HWMON_ROOT` are overridable
+CI runs these checks, including isolated deployment and uninstall tests. Those
+tests cover preflight rejection, config preservation/replacement, deployment
+rollback, full-PWM handoff, cleanup, and preservation of unrelated schedules.
+Tests use temporary fake sensors and command fixtures, not live hardware.
+`CONFIG_FILE`, `STATE_FILE`, and `HWMON_ROOT` are overridable
 for the controller; the exporter also accepts a `CONFIG_FILE` override.
 
 After installing the extra fan bank and drives, record per-drive temperature,
@@ -345,8 +378,8 @@ bash ./uninstall-proxmox.sh
 
 Optional flags:
 
-- `--remove-config`
-- `--remove-data-dir`
+- `--remove-config`: also delete `/etc/hdd-fanwall-control.cfg`.
+- `--remove-data-dir`: remove `/var/lib/fan-control/vm-unraid-hdd` only if empty.
 
 On Unraid:
 
@@ -356,9 +389,10 @@ bash ./uninstall-unraid.sh
 
 Optional flag:
 
-- `--remove-config`
+- `--remove-config`: back up and delete the installed exporter config.
 
-Proxmox uninstall verifies full manual PWM (255) before removing the controller,
+Run both uninstall scripts as root. Proxmox uninstall verifies full manual PWM
+(255) by sysfs readback before removing the controller,
 units, state and lock file. It does not guess a hardware automatic-control mode.
 If that handoff fails, the controller is retained and a previously active timer
 is restarted. Configure a replacement fan controller before reducing fan speed.
@@ -371,6 +405,9 @@ summary, detail file and lock. Other jobs, the virtiofs mount and logs remain.
 Backups are under `/boot/config/custom/fanwall-uninstall.*`; config is retained
 unless `--remove-config` is supplied. Custom wrappers with different names must
 be removed separately. The host enters telemetry fallback after exporter removal.
+Invalid schedule JSON aborts before schedules are changed. Schedule updates and
+file removal are not an automatic rollback transaction; if a later step fails,
+use the printed backup directory to recover the affected registration or files.
 
 Lifecycle tests require Linux user namespaces, Bubblewrap and jq. They run the
 actual lifecycle scripts against temporary files with mocked system services;
