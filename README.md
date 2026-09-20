@@ -110,7 +110,7 @@ proxmox-vm-hdd-fanwall-control/
 4. Schedule the exporter every minute with User Scripts or cron:
 
    ```text
-   * * * * * /boot/config/custom/hdd_temp_export_virtiofs.sh >/dev/null 2>&1
+   * * * * * bash /boot/config/custom/hdd_temp_export_virtiofs.sh >/dev/null 2>&1
    ```
 
 ## Validation
@@ -135,7 +135,7 @@ rm -f /var/lib/fan-control/vm-unraid-hdd/probe.env
 On Unraid:
 
 ```bash
-/boot/config/custom/hdd_temp_export_virtiofs.sh
+bash /boot/config/custom/hdd_temp_export_virtiofs.sh
 cat /mnt/proxmox-fan/hdd_temp_status.env
 ```
 
@@ -285,7 +285,7 @@ On Unraid, run from the new release checkout:
 
 ```bash
 bash ./deploy-unraid.sh --force-config
-/boot/config/custom/hdd_temp_export_virtiofs.sh
+bash /boot/config/custom/hdd_temp_export_virtiofs.sh
 cat /mnt/proxmox-fan/hdd_temp_status.env
 cat /mnt/proxmox-fan/hdd_temp_detail.tsv
 ```
@@ -302,6 +302,7 @@ systemctl start hdd-fanwall-control.service
 /usr/local/sbin/hdd_fanwall_control.sh --status
 ```
 
+Use `bash` for scripts on Unraid’s noexec boot filesystem.
 Both deploy scripts preserve timestamped config backups when `--force-config`
 is used. Preserve the existing Unraid schedule and mount. To roll back, restore
 the saved scripts/configs together and restart the host timer.

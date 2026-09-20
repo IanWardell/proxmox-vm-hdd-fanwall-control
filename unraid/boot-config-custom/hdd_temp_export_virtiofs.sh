@@ -99,8 +99,8 @@ read_disk_temp() {
   fi
 
   # Read identity from the same standby-safe query; never issue a second wake-up query.
-  disk_serial="$(printf '%s\n' "$output" | awk -F: '/^[[:space:]]*Serial [Nn]umber:/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}' | tr '\t\r\n' '   ')"
-  disk_model="$(printf '%s\n' "$output" | awk -F: '/^[[:space:]]*(Device Model|Model Number|Product):/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}' | tr '\t\r\n' '   ')"
+  disk_serial="$(printf '%s\n' "$output" | awk -F: '/^[[:space:]]*Serial [Nn]umber:/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}' | tr '\t\r' '  ')"
+  disk_model="$(printf '%s\n' "$output" | awk -F: '/^[[:space:]]*(Device Model|Model Number|Product):/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}' | tr '\t\r' '  ')"
   disk_serial="${disk_serial:-unknown}" disk_model="${disk_model:-unknown}"
   disk_state=unknown disk_temp=""
   if echo "$output" | grep -qiE 'STANDBY|standby mode'; then
