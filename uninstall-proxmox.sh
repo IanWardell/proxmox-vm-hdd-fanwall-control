@@ -37,13 +37,42 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-systemctl disable --now hdd-fanwall-control.timer || true
-systemctl stop hdd-fanwall-control.service || true
+# Never guess the driver's automatic-control mode. Leave full cooling on removal.
+if [ -f /usr/local/sbin/hdd_fanwall_control.sh ]; then
+  active_hwmon="$(bash /usr/local/sbin/hdd_fanwall_control.sh --print-hwmon-path)"
+  PWM_ENABLE_NAME=pwm2_enable PWM_NAME=pwm2
+  # shellcheck disable=SC1091
+  source /etc/hdd-fanwall-control.cfg
+  timer_active=no
+  if systemctl is-active --quiet hdd-fanwall-control.timer; then timer_active=yes; fi
+  restore_timer_on_error() {
+    local result=$?
+    if [ "$result" -ne 0 ] && [ "$timer_active" = yes ]; then
+      systemctl start hdd-fanwall-control.timer
+    fi
+    exit "$result"
+  }
+  trap restore_timer_on_error EXIT
+  systemctl stop hdd-fanwall-control.timer hdd-fanwall-control.service
+  exec 9>/run/hdd_fanwall_control.state.lock
+  flock -w 30 9
+  printf '1\n' > "$active_hwmon/$PWM_ENABLE_NAME"
+  printf '255\n' > "$active_hwmon/$PWM_NAME"
+  if [ "$(cat "$active_hwmon/$PWM_ENABLE_NAME")" != 1 ] || [ "$(cat "$active_hwmon/$PWM_NAME")" != 255 ]; then
+    echo "Cannot verify full-speed fan handoff; controller retained." >&2
+    exit 1
+  fi
+  trap - EXIT
+  echo "Fan control handed off at full PWM (255); configure a replacement controller before reducing it."
+fi
+if [ -f /etc/systemd/system/hdd-fanwall-control.timer ]; then
+  systemctl disable --now hdd-fanwall-control.timer
+fi
 
 rm -f /etc/systemd/system/hdd-fanwall-control.timer
 rm -f /etc/systemd/system/hdd-fanwall-control.service
 rm -f /usr/local/sbin/hdd_fanwall_control.sh
-rm -f /run/hdd_fanwall_control.state
+rm -f /run/hdd_fanwall_control.state /run/hdd_fanwall_control.state.lock
 
 if [ "$REMOVE_CONFIG" = "yes" ]; then
   rm -f /etc/hdd-fanwall-control.cfg
@@ -61,6 +90,6 @@ if [ "$REMOVE_DATA_DIR" = "yes" ]; then
 fi
 
 systemctl daemon-reload
-systemctl reset-failed || true
+systemctl reset-failed hdd-fanwall-control.service || true
 
 echo "Proxmox uninstall complete."

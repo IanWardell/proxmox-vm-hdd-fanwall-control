@@ -307,6 +307,13 @@ Both deploy scripts preserve timestamped config backups when `--force-config`
 is used. Preserve the existing Unraid schedule and mount. To roll back, restore
 the saved scripts/configs together and restart the host timer.
 
+Proxmox deployment validates the selected configuration before changing the
+installation. It backs up installed files under `/var/tmp/hdd-fanwall-deploy.*`,
+stops the timer during replacement, restarts it and runs the controller once.
+Deployment failures restore the previous files and timer state. An incompatible
+older configuration is rejected before replacement; use `--force-config` after
+reviewing the production defaults.
+
 ## Automated and hardware validation
 
 ```bash
@@ -333,7 +340,7 @@ not established by the automated tests.
 On Proxmox:
 
 ```bash
-./uninstall-proxmox.sh
+bash ./uninstall-proxmox.sh
 ```
 
 Optional flags:
@@ -344,9 +351,27 @@ Optional flags:
 On Unraid:
 
 ```bash
-./uninstall-unraid.sh
+bash ./uninstall-unraid.sh
 ```
 
 Optional flag:
 
 - `--remove-config`
+
+Proxmox uninstall verifies full manual PWM (255) before removing the controller,
+units, state and lock file. It does not guess a hardware automatic-control mode.
+If that handoff fails, the controller is retained and a previously active timer
+is restarted. Configure a replacement fan controller before reducing fan speed.
+`--remove-data-dir` removes only an empty share directory.
+
+Unraid uninstall backs up and removes the exporter’s standard User Scripts
+registration, its persistent/cached schedule entries and matching root crontab
+commands. It waits for an active export to finish, then removes the exporter,
+summary, detail file and lock. Other jobs, the virtiofs mount and logs remain.
+Backups are under `/boot/config/custom/fanwall-uninstall.*`; config is retained
+unless `--remove-config` is supplied. Custom wrappers with different names must
+be removed separately. The host enters telemetry fallback after exporter removal.
+
+Lifecycle tests require Linux user namespaces, Bubblewrap and jq. They run the
+actual lifecycle scripts against temporary files with mocked system services;
+they never uninstall the live deployment.
